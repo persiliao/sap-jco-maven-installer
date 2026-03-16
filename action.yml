@@ -1,0 +1,371 @@
+name: 'Install SAP JCo to Maven Local Repository'
+description: 'Install SAP Java Connector (JCo) JAR from custom path to local Maven repository'
+author: 'Persi.Liao'
+
+inputs:
+  jco-version:
+    description: 'SAP JCo version (e.g., 3.1.0, 3.0.20)'
+    required: false
+    default: '3.1.0'
+  jco-jar-path:
+    description: 'Path to SAP JCo JAR file. Can be absolute or relative to workspace.'
+    required: true
+  jco-pom-path:
+    description: 'Optional path to POM file for the JCo artifact'
+    required: false
+  jco-group-id:
+    description: 'Maven groupId for SAP JCo'
+    required: false
+    default: 'com.sap.conn.jco'
+  jco-artifact-id:
+    description: 'Maven artifactId for SAP JCo'
+    required: false
+    default: 'sapjco3'
+  jco-packaging:
+    description: 'Maven packaging type'
+    required: false
+    default: 'jar'
+  jco-classifier:
+    description: 'Optional classifier (e.g., linux-x86_64)'
+    required: false
+  fail-if-missing:
+    description: 'Fail if JAR file is not found'
+    required: false
+    default: 'true'
+  maven-home:
+    description: 'Custom Maven home directory (optional)'
+    required: false
+    default: ''
+  skip-verification:
+    description: 'Skip installation verification step'
+    required: false
+    default: 'false'
+
+outputs:
+  maven-repo-path:
+    description: 'Path to Maven local repository'
+    value: ${{ steps.setup-maven.outputs.maven-repo-path }}
+  installation-verified:
+    description: 'Whether SAP JCo was successfully installed'
+    value: ${{ steps.verify-installation.outputs.success }}
+  installed-coordinates:
+    description: 'Maven coordinates of installed artifact'
+    value: ${{ steps.verify-installation.outputs.coordinates }}
+  jar-file-info:
+    description: 'JAR file information'
+    value: ${{ steps.validate-jar.outputs.file-info }}
+  installation-timestamp:
+    description: 'Timestamp of installation'
+    value: ${{ steps.install-jco.outputs.timestamp }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Maven environment
+      id: setup-maven
+      shell: bash
+      run: |
+        # 确定 Maven 主目录
+        if [ -n "${{ inputs.maven-home }}" ]; then
+          MAVEN_HOME="${{ inputs.maven-home }}"
+        elif [ -n "$MAVEN_HOME" ]; then
+          MAVEN_HOME="$MAVEN_HOME"
+        else
+          MAVEN_HOME="$HOME/.m2"
+        fi
+        
+        # 设置 Maven 本地仓库路径
+        MAVEN_REPO="$MAVEN_HOME/repository"
+        echo "MAVEN_REPO=$MAVEN_REPO" >> $GITHUB_ENV
+        echo "maven-repo-path=$MAVEN_REPO" >> $GITHUB_OUTPUT
+        
+        # 检查 Maven 命令是否可用
+        if ! command -v mvn &> /dev/null; then
+          echo "WARNING: Maven (mvn) command not found in PATH"
+          echo "Please ensure Maven is installed or use setup-java action first"
+        else
+          echo "Maven version:"
+          mvn --version
+        fi
+        
+        echo "Maven repository path: $MAVEN_REPO"
+    
+    - name: Resolve and validate JCo JAR path
+      id: resolve-jar-path
+      shell: bash
+      run: |
+        JAR_PATH="${{ inputs.jco-jar-path }}"
+        
+        # 如果是相对路径，转换为绝对路径
+        if [[ ! "$JAR_PATH" =~ ^/ ]]; then
+          JAR_PATH="$GITHUB_WORKSPACE/$JAR_PATH"
+        fi
+        
+        # 标准化路径（处理多余的斜杠）
+        JAR_PATH=$(realpath -m "$JAR_PATH" 2>/dev/null || echo "$JAR_PATH")
+        
+        echo "Resolved JAR path: $JAR_PATH"
+        
+        # 检查文件是否存在
+        if [ ! -f "$JAR_PATH" ]; then
+          if [ "${{ inputs.fail-if-missing }}" = "true" ]; then
+            echo "::error::SAP JCo JAR not found at: ${{ inputs.jco-jar-path }}"
+            echo "::error::Resolved path: $JAR_PATH"
+            echo "::group::Workspace contents"
+            ls -la "$GITHUB_WORKSPACE/" 2>/dev/null | head -20 || echo "Cannot list workspace"
+            echo "::endgroup::"
+            exit 1
+          else
+            echo "::warning::SAP JCo JAR not found at: $JAR_PATH"
+            echo "Skipping JCo installation"
+            echo "jar-exists=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+        fi
+        
+        echo "jar-exists=true" >> $GITHUB_OUTPUT
+        echo "resolved-jar-path=$JAR_PATH" >> $GITHUB_OUTPUT
+    
+    - name: Validate JAR file
+      id: validate-jar
+      if: steps.resolve-jar-path.outputs.jar-exists == 'true'
+      shell: bash
+      run: |
+        JAR_PATH="${{ steps.resolve-jar-path.outputs.resolved-jar-path }}"
+        
+        echo "Validating JAR file: $JAR_PATH"
+        echo "::group::JAR file details"
+        
+        # 获取文件信息
+        FILE_INFO=$(stat -c "%n|%s|%y|%U:%G|%A" "$JAR_PATH" 2>/dev/null)
+        if [ $? -ne 0 ]; then
+          # macOS 兼容
+          FILE_INFO=$(stat -f "%N|%z|%Sm|%Su:%Sg|%Sp" "$JAR_PATH")
+        fi
+        
+        IFS='|' read -r FILE_NAME FILE_SIZE FILE_MOD FILE_OWNER FILE_PERM <<< "$FILE_INFO"
+        
+        # 检查文件扩展名
+        if [[ ! "$JAR_PATH" =~ \.(jar|JAR)$ ]]; then
+          echo "::warning::File does not have .jar extension: $(basename "$JAR_PATH")"
+        fi
+        
+        # 验证是否为有效的 JAR/ZIP 文件
+        echo "Checking file type..."
+        FILE_TYPE=$(file -b "$JAR_PATH" 2>/dev/null || echo "Unknown")
+        
+        if echo "$FILE_TYPE" | grep -qi "java archive\|zip archive"; then
+          echo "✓ Valid JAR/ZIP file detected: $FILE_TYPE"
+          IS_VALID_JAR=true
+        elif jar -tf "$JAR_PATH" &> /dev/null; then
+          echo "✓ Valid JAR file (jar command verification)"
+          IS_VALID_JAR=true
+        else
+          echo "::warning::File may not be a valid JAR: $FILE_TYPE"
+          IS_VALID_JAR=false
+        fi
+        
+        # 尝试从文件名推断版本
+        FILENAME=$(basename "$JAR_PATH")
+        INFERRED_VERSION=""
+        if [[ "$FILENAME" =~ [Ss][Aa][Pp][Jj][Cc][Oo]3?[_-]?([0-9]+\.[0-9]+\.[0-9]+)\.jar ]]; then
+          INFERRED_VERSION="${BASH_REMATCH[1]}"
+          echo "Inferred version from filename: $INFERRED_VERSION"
+        fi
+        
+        # 输出文件信息
+        FILE_INFO_JSON=$(jq -n \
+          --arg path "$JAR_PATH" \
+          --arg filename "$FILENAME" \
+          --arg size "$FILE_SIZE" \
+          --arg modified "$FILE_MOD" \
+          --arg owner "$FILE_OWNER" \
+          --arg permissions "$FILE_PERM" \
+          --arg fileType "$FILE_TYPE" \
+          --arg isValidJar "$IS_VALID_JAR" \
+          --arg inferredVersion "$INFERRED_VERSION" \
+          '{path: $path, filename: $filename, size: $size|tonumber, modified: $modified, owner: $owner, permissions: $permissions, fileType: $fileType, isValidJar: $isValidJar|test("true"), inferredVersion: $inferredVersion}' 2>/dev/null || echo "{\"path\":\"$JAR_PATH\",\"filename\":\"$FILENAME\",\"size\":$FILE_SIZE}")
+        
+        echo "file-info=$FILE_INFO_JSON" >> $GITHUB_OUTPUT
+        
+        echo "File: $FILENAME"
+        echo "Size: $((FILE_SIZE / 1024 / 1024)) MB"
+        echo "Permissions: $FILE_PERM"
+        echo "Owner: $FILE_OWNER"
+        echo "Modified: $FILE_MOD"
+        echo "::endgroup::"
+        
+        if [ "$IS_VALID_JAR" = "false" ] && [ "${{ inputs.fail-if-missing }}" = "true" ]; then
+          echo "::error::Invalid JAR file detected"
+          exit 1
+        fi
+    
+    - name: Resolve POM file path
+      id: resolve-pom-path
+      if: ${{ inputs.jco-pom-path != '' && steps.resolve-jar-path.outputs.jar-exists == 'true' }}
+      shell: bash
+      run: |
+        POM_PATH="${{ inputs.jco-pom-path }}"
+        
+        # 如果是相对路径，转换为绝对路径
+        if [[ ! "$POM_PATH" =~ ^/ ]]; then
+          POM_PATH="$GITHUB_WORKSPACE/$POM_PATH"
+        fi
+        
+        POM_PATH=$(realpath -m "$POM_PATH" 2>/dev/null || echo "$POM_PATH")
+        
+        if [ ! -f "$POM_PATH" ]; then
+          echo "::warning::POM file not found at: ${{ inputs.jco-pom-path }}"
+          echo "pom-exists=false" >> $GITHUB_OUTPUT
+        else
+          echo "Using POM file: $POM_PATH"
+          echo "pom-exists=true" >> $GITHUB_OUTPUT
+          echo "resolved-pom-path=$POM_PATH" >> $GITHUB_OUTPUT
+        fi
+    
+    - name: Install SAP JCo to Maven local
+      id: install-jco
+      if: steps.resolve-jar-path.outputs.jar-exists == 'true'
+      shell: bash
+      run: |
+        JAR_PATH="${{ steps.resolve-jar-path.outputs.resolved-jar-path }}"
+        
+        echo "::group::Installing SAP JCo"
+        echo "Source: $JAR_PATH"
+        echo "GroupId: ${{ inputs.jco-group-id }}"
+        echo "ArtifactId: ${{ inputs.jco-artifact-id }}"
+        echo "Version: ${{ inputs.jco-version }}"
+        echo "Packaging: ${{ inputs.jco-packaging }}"
+        [[ -n "${{ inputs.jco-classifier }}" ]] && echo "Classifier: ${{ inputs.jco-classifier }}"
+        echo "::endgroup::"
+        
+        # 构建 Maven 安装命令
+        INSTALL_ARGS=(
+          "install:install-file"
+          "-Dfile=$JAR_PATH"
+          "-DgroupId=${{ inputs.jco-group-id }}"
+          "-DartifactId=${{ inputs.jco-artifact-id }}"
+          "-Dversion=${{ inputs.jco-version }}"
+          "-Dpackaging=${{ inputs.jco-packaging }}"
+        )
+        
+        # 添加可选的 classifier
+        if [ -n "${{ inputs.jco-classifier }}" ]; then
+          INSTALL_ARGS+=("-Dclassifier=${{ inputs.jco-classifier }}")
+        fi
+        
+        # 添加可选的 POM 文件
+        if [ "${{ steps.resolve-pom-path.outputs.pom-exists }}" = "true" ]; then
+          POM_PATH="${{ steps.resolve-pom-path.outputs.resolved-pom-path }}"
+          INSTALL_ARGS+=("-DpomFile=$POM_PATH")
+          echo "Using POM file: $POM_PATH"
+        else
+          INSTALL_ARGS+=("-DgeneratePom=true")
+        fi
+        
+        # 添加本地仓库路径
+        INSTALL_ARGS+=("-DlocalRepositoryPath=$MAVEN_REPO")
+        
+        echo "Executing: mvn ${INSTALL_ARGS[*]}"
+        echo "::group::Maven output"
+        mvn "${INSTALL_ARGS[@]}"
+        MAVEN_EXIT_CODE=$?
+        echo "::endgroup::"
+        
+        if [ $MAVEN_EXIT_CODE -eq 0 ]; then
+          echo "::notice::SAP JCo installed successfully to local Maven repository"
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          echo "timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
+        else
+          echo "::error::Failed to install SAP JCo (exit code: $MAVEN_EXIT_CODE)"
+          exit 1
+        fi
+    
+    - name: Verify installation
+      id: verify-installation
+      if: steps.install-jco.conclusion == 'success' && inputs.skip-verification != 'true'
+      shell: bash
+      run: |
+        # 构建本地仓库中的路径
+        GROUP_PATH=$(echo "${{ inputs.jco-group-id }}" | tr '.' '/')
+        ARTIFACT_DIR="$MAVEN_REPO/$GROUP_PATH/${{ inputs.jco-artifact-id }}/${{ inputs.jco-version }}"
+        
+        # 构建文件名
+        FILENAME="${{ inputs.jco-artifact-id }}-${{ inputs.jco-version }}"
+        if [ -n "${{ inputs.jco-classifier }}" ]; then
+          FILENAME="$FILENAME-${{ inputs.jco-classifier }}"
+        fi
+        FILENAME="$FILENAME.${{ inputs.jco-packaging }}"
+        
+        JAR_FILE="$ARTIFACT_DIR/$FILENAME"
+        POM_FILE="$ARTIFACT_DIR/${{ inputs.jco-artifact-id }}-${{ inputs.jco-version }}.pom"
+        
+        echo "Verifying installation..."
+        echo "Expected JAR: $JAR_FILE"
+        echo "Expected POM: $POM_FILE"
+        
+        if [ -f "$JAR_FILE" ]; then
+          echo "::notice::✓ JAR file verified: $JAR_FILE"
+          JAR_VERIFIED=true
+        else
+          echo "::error::JAR file not found: $JAR_FILE"
+          JAR_VERIFIED=false
+        fi
+        
+        if [ -f "$POM_FILE" ]; then
+          echo "::notice::✓ POM file verified: $POM_FILE"
+          POM_VERIFIED=true
+        else
+          echo "::warning::POM file not found: $POM_FILE"
+          POM_VERIFIED=false
+        fi
+        
+        if [ "$JAR_VERIFIED" = "true" ]; then
+          echo "success=true" >> $GITHUB_OUTPUT
+          
+          # 构建 Maven 坐标
+          COORDINATES="${{ inputs.jco-group-id }}:${{ inputs.jco-artifact-id }}:${{ inputs.jco-version }}"
+          if [ -n "${{ inputs.jco-classifier }}" ]; then
+            COORDINATES="$COORDINATES:${{ inputs.jco-classifier }}"
+          fi
+          COORDINATES="$COORDINATES:${{ inputs.jco-packaging }}"
+          
+          echo "coordinates=$COORDINATES" >> $GITHUB_OUTPUT
+          
+          # 输出到 Step Summary
+          {
+            echo "## ✅ SAP JCo Installation Complete"
+            echo ""
+            echo "### Installation Details"
+            echo "- **Source JAR:** \`${{ inputs.jco-jar-path }}\`"
+            echo "- **Maven Coordinates:** \`$COORDINATES\`"
+            echo "- **Installation Path:** \`$JAR_FILE\`"
+            echo "- **Installed At:** ${{ steps.install-jco.outputs.timestamp }}"
+            echo ""
+            echo "### Maven Dependency"
+            echo '```xml'
+            echo "<dependency>"
+            echo "  <groupId>${{ inputs.jco-group-id }}</groupId>"
+            echo "  <artifactId>${{ inputs.jco-artifact-id }}</artifactId>"
+            echo "  <version>${{ inputs.jco-version }}</version>"
+            if [ -n "${{ inputs.jco-classifier }}" ]; then
+              echo "  <classifier>${{ inputs.jco-classifier }}</classifier>"
+            fi
+            echo "</dependency>"
+            echo '```'
+            echo ""
+            echo "### Files Verified"
+            echo "- ✅ JAR file: \`$JAR_FILE\`"
+            if [ "$POM_VERIFIED" = "true" ]; then
+              echo "- ✅ POM file: \`$POM_FILE\`"
+            else
+              echo "- ⚠️ POM file: Not found (auto-generated)"
+            fi
+          } >> $GITHUB_STEP_SUMMARY
+        else
+          echo "::error::Installation verification failed"
+          echo "Directory contents:"
+          ls -la "$ARTIFACT_DIR" 2>/dev/null || echo "Directory not found"
+          echo "success=false" >> $GITHUB_OUTPUT
+          exit 1
+        fi
